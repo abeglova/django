@@ -60,6 +60,12 @@ class Combinable:
     BITRIGHTSHIFT = ">>"
     BITXOR = "#"
 
+    # This allows CombinedExpression.dispatch to register special handling
+    # for given operand types, regardless of operator
+    ANY = None
+
+    
+
     def _combine(self, other, connector, reversed):
         if not hasattr(other, "resolve_expression"):
             # everything must be resolvable to an expression
@@ -688,6 +694,12 @@ _connector_combinations = [
             (fields.TimeField, fields.TimeField, fields.DurationField),
         ],
     },
+    # CharField/TextField addition (concatenation).
+    {
+        Combinable.ADD: [
+            (fields.CharField, fields.CharField, fields.CharField),
+        ],
+    },
 ]
 
 _connector_combinators = defaultdict(list)
@@ -725,7 +737,21 @@ def _resolve_combined_type(connector, lhs_type, rhs_type):
             return combined_type
 
 
+@functools.lru_cache(maxsize=128)
+def _is_combinable_type(field_type):
+    """Return True if field_type is registered in any combinator entry."""
+    for combinators in _connector_combinators.values():
+        for combinator_lhs_type, combinator_rhs_type, _ in combinators:
+            if issubclass(field_type, combinator_lhs_type) or issubclass(
+                field_type, combinator_rhs_type
+            ):
+                return True
+    return False
+
+
 class CombinedExpression(SQLiteNumericMixin, Expression):
+    _dispatch_registry = []
+
     def __init__(self, lhs, connector, rhs, output_field=None):
         super().__init__(output_field=output_field)
         self.connector = connector
@@ -747,15 +773,21 @@ class CombinedExpression(SQLiteNumericMixin, Expression):
     def _resolve_output_field(self):
         # We avoid using super() here for reasons given in
         # Expression._resolve_output_field()
-        combined_type = _resolve_combined_type(
-            self.connector,
-            type(self.lhs._output_field_or_none),
-            type(self.rhs._output_field_or_none),
-        )
+        lhs_type = type(self.lhs._output_field_or_none)
+        rhs_type = type(self.rhs._output_field_or_none)
+        combined_type = _resolve_combined_type(self.connector, lhs_type, rhs_type)
         if combined_type is None:
+            # Fall back to the default logic only for field types not known to
+            # the combinator registry (e.g. ArrayField). Types that ARE
+            # registered but not for this specific connector should still raise.
+            if not _is_combinable_type(lhs_type) and not _is_combinable_type(rhs_type):
+                try:
+                    return super()._resolve_output_field()
+                except FieldError:
+                    pass
             raise FieldError(
-                f"Cannot infer type of {self.connector!r} expression involving these "
-                f"types: {self.lhs.output_field.__class__.__name__}, "
+                f"Cannot infer type of {self.connector!r} expression involving "
+                f"these types: {self.lhs.output_field.__class__.__name__}, "
                 f"{self.rhs.output_field.__class__.__name__}. You must set "
                 f"output_field."
             )
@@ -787,13 +819,35 @@ class CombinedExpression(SQLiteNumericMixin, Expression):
         )
         if not isinstance(self, (DurationExpression, TemporalSubtraction)):
             try:
-                lhs_type = resolved.lhs.output_field.get_internal_type()
+                lhs_field = resolved.lhs.output_field
             except (AttributeError, FieldError):
-                lhs_type = None
+                lhs_field = None
             try:
-                rhs_type = resolved.rhs.output_field.get_internal_type()
+                rhs_field = resolved.rhs.output_field
             except (AttributeError, FieldError):
-                rhs_type = None
+                rhs_field = None
+            # Check dispatch registry for a matching expression class.
+            if lhs_field is not None and rhs_field is not None:
+                for reg_connector, reg_lhs_types, reg_rhs_types, klass in (
+                    self._dispatch_registry
+                ):
+                    if (
+                        resolved.connector == reg_connector
+                        and isinstance(lhs_field, reg_lhs_types)
+                        and isinstance(rhs_field, reg_rhs_types)
+                    ):
+                        return klass(
+                            resolved.lhs,
+                            resolved.connector,
+                            resolved.rhs,
+                            output_field=resolved._output_field_or_none,
+                        )
+            lhs_type = (
+                lhs_field.get_internal_type() if lhs_field is not None else None
+            )
+            rhs_type = (
+                rhs_field.get_internal_type() if rhs_field is not None else None
+            )
             if "DurationField" in {lhs_type, rhs_type} and lhs_type != rhs_type:
                 return DurationExpression(
                     resolved.lhs, resolved.connector, resolved.rhs
@@ -806,6 +860,19 @@ class CombinedExpression(SQLiteNumericMixin, Expression):
             ):
                 return TemporalSubtraction(resolved.lhs, resolved.rhs)
         return resolved
+
+    @classmethod
+    def dispatch(cls, connector, lhs_types, rhs_types):
+        """
+        Class decorator to register an expression class for specific
+        connector and field type combinations.
+        """
+
+        def decorator(klass):
+            cls._dispatch_registry.append((connector, lhs_types, rhs_types, klass))
+            return klass
+
+        return decorator
 
     @cached_property
     def allowed_default(self):
